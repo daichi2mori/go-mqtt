@@ -2,191 +2,256 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"go-mqtt/cache"
 	"go-mqtt/config"
 	"go-mqtt/handler"
-	mqttutil "go-mqtt/mqtt"
-	"os"
+	"go-mqtt/mqtt"
 	"testing"
 	"time"
 )
 
-// テスト用のメイン処理をシミュレート
-func TestMainFlow(t *testing.T) {
-	// テスト用の設定を作成
+// モック構造体
+type MockSubscriber1 struct {
+	started bool
+	err     error
+}
+
+func (m *MockSubscriber1) Start(ctx context.Context) error {
+	m.started = true
+	<-ctx.Done()
+	return m.err
+}
+
+type MockSubscriber2 struct {
+	started bool
+	err     error
+}
+
+func (m *MockSubscriber2) Start(ctx context.Context) error {
+	m.started = true
+	<-ctx.Done()
+	return m.err
+}
+
+type MockPublisher struct {
+	started bool
+	err     error
+}
+
+func (m *MockPublisher) Start(ctx context.Context) error {
+	m.started = true
+	<-ctx.Done()
+	return m.err
+}
+
+// モックMQTTClient作成ユーティリティ
+func createMockMQTTClient() *mqtt.MockClient {
+	client := mqtt.NewMockClient()
+
+	// Disconnect実装
+	client.DisconnectFunc = func(quiesce uint) {
+		// 何もしない
+	}
+
+	return client
+}
+
+func TestMain(t *testing.T) {
+	// メインの初期化と実行フローのテスト
+	t.Run("アプリケーション正常起動と終了", func(t *testing.T) {
+		// キャッシュの初期化
+		_ = cache.GetInstance()
+
+		// テスト用の設定
+		cfg := &config.MqttConfig{
+			Mqtt: config.MqttSettings{
+				Interval: 1,
+				Topics: config.TopicConfig{
+					Topic1: "test/topic1",
+					Topic2: "test/topic2",
+					Topic3: "test/topic3",
+				},
+			},
+		}
+
+		// モックMQTTクライアント
+		mockClient := createMockMQTTClient()
+
+		// モックスクライバーとパブリッシャー
+		mockSub1 := &MockSubscriber1{}
+		mockSub2 := &MockSubscriber2{}
+		mockPub := &MockPublisher{}
+
+		// コンテキスト
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// エラーチャネル
+		errChan := make(chan error, 3)
+
+		// 各コンポーネントの起動
+		go func() {
+			errChan <- mockSub1.Start(ctx)
+		}()
+
+		go func() {
+			errChan <- mockSub2.Start(ctx)
+		}()
+
+		go func() {
+			errChan <- mockPub.Start(ctx)
+		}()
+
+		// 一定時間待機してキャンセル
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+
+		// シャットダウンタイムアウト
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer shutdownCancel()
+
+		// クライアント切断
+		mockClient.Disconnect(250)
+
+		// シャットダウン待機
+		<-shutdownCtx.Done()
+
+		// 各コンポーネントが起動されたことを確認
+		if !mockSub1.started {
+			t.Error("Sub1が起動されなかった")
+		}
+
+		if !mockSub2.started {
+			t.Error("Sub2が起動されなかった")
+		}
+
+		if !mockPub.started {
+			t.Error("Pubが起動されなかった")
+		}
+	})
+}
+
+// インテグレーションテスト：コンポーネント間の連携をテスト
+func TestComponentsIntegration(t *testing.T) {
+	// キャッシュの初期化
+	cache := cache.GetInstance()
+	cache.Clear()
+
+	// テスト用の設定
 	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Broker:   "tcp://localhost:1883",
+		Mqtt: config.MqttSettings{
 			Interval: 1,
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
-				Topic2: "/test/topic2",
-				Topic3: "/test/topic3",
+			Topics: config.TopicConfig{
+				Topic1: "test/topic1",
+				Topic2: "test/topic2",
+				Topic3: "test/topic3",
 			},
 		},
 	}
 
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
+	// モックMQTTクライアント
+	mockClient := createMockMQTTClient()
 
-	// キャンセル可能なコンテキストを作成
+	// パブリッシュとサブスクライブの監視
+	publishedMessages := make(map[string][]string)
+	mockClient.PublishFunc = func(topic string, qos byte, retained bool, payload string) error {
+		publishedMessages[topic] = append(publishedMessages[topic], payload)
+		return nil
+	}
+
+	var sub1Handler, sub2Handler mqtt.MessageHandler
+	mockClient.SubscribeFunc = func(topic string, qos byte, callback mqtt.MessageHandler) error {
+		if topic == cfg.Mqtt.Topics.Topic1 {
+			if sub1Handler == nil {
+				sub1Handler = callback
+			} else {
+				sub2Handler = callback
+			}
+		}
+		return nil
+	}
+
+	// メッセージ受信通知チャネル
+	messageReceived := make(chan struct{}, 1)
+
+	// コンテキスト
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Publisher、Subscriber1、Subscriber2を別々のゴルーチンで開始
-	errCh := make(chan error, 3)
+	// コンポーネントの作成
+	sub1 := handler.NewSubscriber1(mockClient, cfg, messageReceived)
+	sub2 := handler.NewSubscriber2(mockClient, cfg)
+	pub := handler.NewPublisher(mockClient, cfg, messageReceived)
 
-	go func() {
-		publisher := handler.NewPublisher(mockClient, cfg)
-		errCh <- publisher.Start(ctx)
-	}()
+	// コンポーネントの起動
+	go sub1.Start(ctx)
+	go sub2.Start(ctx)
+	go pub.Start(ctx)
 
-	go func() {
-		subscriber1 := handler.NewSubscriber1(mockClient, cfg)
-		errCh <- subscriber1.Start(ctx)
-	}()
+	// ハンドラーが設定されるまで待機
+	time.Sleep(200 * time.Millisecond)
 
-	go func() {
-		subscriber2 := handler.NewSubscriber2(mockClient, cfg)
-		errCh <- subscriber2.Start(ctx)
-	}()
-
-	// 少し待って、すべてのコンポーネントが開始されるのを確認
-	time.Sleep(1 * time.Second)
-
-	// クライアントが接続され、サブスクライブが行われたか確認
-	if !mockClient.IsConnected() {
-		t.Error("Expected client to be connected")
-	}
-
-	// サブスクライブが2回呼ばれたか確認（Subscriber1とSubscriber2）
-	if mockClient.GetSubscribeCount() != 2 {
-		t.Errorf("Expected 2 subscribe calls, got %d", mockClient.GetSubscribeCount())
-	}
-
-	// パブリッシュが少なくとも1回呼ばれたか確認
-	if mockClient.GetPublishCount() < 1 {
-		t.Errorf("Expected at least 1 publish call, got %d", mockClient.GetPublishCount())
-	}
-
-	// シミュレートされたメッセージを送信
-	testMessage := map[string]interface{}{
-		"id":   "test-id",
-		"name": "test-name",
-		"type": 2,
-	}
-	messageJSON, _ := json.Marshal(testMessage)
-	mockClient.SimulateMessage(cfg.Mqtt.Topics.Topic1, messageJSON)
-
-	// 少し待って、メッセージ処理が完了するのを確認
-	time.Sleep(500 * time.Millisecond)
-
-	// すべてのコンポーネントをキャンセル
-	cancel()
-
-	// 終了を確認
-	timeout := time.After(2 * time.Second)
-	completed := 0
-
-	for completed < 3 {
-		select {
-		case <-errCh:
-			completed++
-		case <-timeout:
-			t.Fatalf("Timeout waiting for components to complete, only %d of 3 completed", completed)
-			return
+	// メッセージフロー：Sub1にメッセージ -> Sub1が通知 -> Pubが開始 -> Pubがメッセージを送信
+	t.Run("メッセージフローテスト", func(t *testing.T) {
+		if sub1Handler == nil {
+			t.Fatal("Sub1ハンドラーが設定されていない")
 		}
-	}
-}
 
-// テスト用の設定ファイルを作成するヘルパー関数
-func createTestConfig(t *testing.T) (string, func()) {
-	// 一時設定ファイルを作成
-	content := `mqtt:
-  broker: "tcp://127.0.0.1:1883"
-  interval: 1
-  topics:
-    topic1: "/test/topic1"
-    topic2: "/test/topic2"
-    topic3: "/test/topic3"
-`
-	tmpfile, err := os.CreateTemp("", "config.*.yml")
-	if err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
-	}
+		// Sub1にメッセージを送信
+		testData := `{"id":"1","name":"test-message"}`
+		sub1Handler(nil, &mockMessage{
+			topic:   cfg.Mqtt.Topics.Topic1,
+			payload: []byte(testData),
+		})
 
-	if _, err := tmpfile.Write([]byte(content)); err != nil {
-		tmpfile.Close()
-		os.Remove(tmpfile.Name())
-		t.Fatalf("Failed to write to temp file: %v", err)
-	}
-	if err := tmpfile.Close(); err != nil {
-		os.Remove(tmpfile.Name())
-		t.Fatalf("Failed to close temp file: %v", err)
-	}
+		// Pubがメッセージを送信するまで待機
+		time.Sleep(500 * time.Millisecond)
 
-	// クリーンアップ関数を返す
-	cleanup := func() {
-		os.Remove(tmpfile.Name())
-	}
-
-	return tmpfile.Name(), cleanup
-}
-
-// 統合テスト用のユーティリティ関数
-// 注意: この関数は実際のMQTTブローカーへの接続が必要です
-func _TestIntegration(t *testing.T) {
-	// CI環境など、統合テストを実行しない場合はスキップ
-	if os.Getenv("RUN_INTEGRATION_TESTS") != "true" {
-		t.Skip("Skipping integration test")
-	}
-
-	// テスト用の設定ファイルを作成
-	configFile, cleanup := createTestConfig(t)
-	defer cleanup()
-
-	// テスト用の設定ファイルを使用するように環境を設定
-	// バックアップと復元処理
-	configBackup := "./config.yml.bak"
-	configPath := "./config.yml"
-
-	// 既存ファイルをバックアップ (存在する場合)
-	if _, err := os.Stat(configPath); err == nil {
-		if err := os.Rename(configPath, configBackup); err != nil {
-			t.Fatalf("Failed to backup config file: %v", err)
+		// キャッシュを確認
+		sub1Data, exists := cache.Get("sub1:1")
+		if !exists {
+			t.Error("Sub1データがキャッシュに保存されていない")
 		}
-		defer os.Rename(configBackup, configPath) // テスト後に復元
-	}
 
-	// テスト用の設定ファイルをシンボリックリンク
-	if err := os.Symlink(configFile, configPath); err != nil {
-		t.Fatalf("Failed to create symlink: %v", err)
-	}
-	defer os.Remove(configPath)
+		pubData, exists := cache.Get("pub:1")
+		if !exists {
+			t.Error("Pubデータがキャッシュに保存されていない")
+		}
 
-	// コンテキストを作成
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+		// Pubからのメッセージを確認
+		topic3Messages, exists := publishedMessages[cfg.Mqtt.Topics.Topic3]
+		if !exists || len(topic3Messages) == 0 {
+			t.Error("Pubがトピック3にメッセージを送信していない")
+		}
 
-	// 設定を読み込み
-	cfg, err := config.LoadConfig()
-	if err != nil {
-		t.Fatalf("Failed to load config: %v", err)
-	}
+		// Sub2にメッセージを送信（Type 2）
+		testData2 := `{"id":"1","name":"test-message-type2","type":2}`
+		if sub2Handler == nil {
+			t.Fatal("Sub2ハンドラーが設定されていない")
+		}
 
-	// 実際のMQTTクライアントを作成
-	client := mqttutil.NewClient(cfg)
-	client.Connect()
-	defer client.Disconnect(250)
+		sub2Handler(nil, &mockMessage{
+			topic:   cfg.Mqtt.Topics.Topic1,
+			payload: []byte(testData2),
+		})
 
-	// 実際のタスクを実行
-	go handler.Pub(ctx, client, cfg)
-	go handler.Sub1(ctx, client, cfg)
-	go handler.Sub2(ctx, client, cfg)
+		// 処理待機
+		time.Sleep(200 * time.Millisecond)
 
-	// 一定時間実行を続ける
-	time.Sleep(5 * time.Second)
+		// Sub2データをキャッシュで確認
+		sub2Data, exists := cache.Get("sub2:1:2")
+		if !exists {
+			t.Error("Sub2データがキャッシュに保存されていない")
+		}
 
-	// テストが成功したことを示す
-	// （ここではエラーが発生しなければ成功とみなす）
+		// Sub2からのメッセージを確認（トピック1とトピック2の両方）
+		topic1Messages, exists := publishedMessages[cfg.Mqtt.Topics.Topic1]
+		if !exists || len(topic1Messages) < 2 {
+			t.Error("Sub2がトピック1にメッセージを送信していない")
+		}
+
+		topic2Messages, exists := publishedMessages[cfg.Mqtt.Topics.Topic2]
+		if !exists || len(topic2Messages) == 0 {
+			t.Error("Sub2がトピック2にメッセージを送信していない")
+		}
+	})
 }

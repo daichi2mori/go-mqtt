@@ -3,268 +3,390 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"go-mqtt/cache"
 	"go-mqtt/config"
-	mqttutil "go-mqtt/mqtt"
+	"go-mqtt/mqtt"
 	"testing"
 	"time"
+
+	MQTT "github.com/eclipse/paho.mqtt.golang"
 )
 
-func TestMQTTSubscriber2_Start(t *testing.T) {
-	// テスト用の設定を準備
+func TestSubscriber2_Start(t *testing.T) {
+	// キャッシュの初期化
+	_ = cache.GetInstance()
+
+	// テスト用の設定
 	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Broker:   "tcp://localhost:1883",
-			Interval: 1,
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
-				Topic2: "/test/topic2",
+		Mqtt: config.MqttSettings{
+			Topics: config.TopicConfig{
+				Topic1: "test/topic1",
+				Topic2: "test/topic2",
 			},
 		},
 	}
 
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
+	t.Run("通常動作：サブスクリプション成功後にコンテキストキャンセルで終了", func(t *testing.T) {
+		// モックMQTTクライアントの作成
+		mockClient := mqtt.NewMockClient()
 
-	// サブスクライバーを作成
-	subscriber := NewSubscriber2(mockClient, cfg)
-
-	// コンテキストを作成して、すぐにキャンセルできるようにする
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// エラーチャネルを作成して、非同期でサブスクライバーを開始
-	errCh := make(chan error)
-	go func() {
-		errCh <- subscriber.Start(ctx)
-	}()
-
-	// サブスクライバーがトピックをサブスクライブするのを待つ
-	time.Sleep(500 * time.Millisecond)
-
-	// サブスクライバーが正しいトピックをサブスクライブしたか確認
-	if mockClient.GetSubscribeCount() != 1 {
-		t.Errorf("Expected 1 subscribe call, got %d", mockClient.GetSubscribeCount())
-	}
-
-	if mockClient.GetLastSubscribeTopic() != cfg.Mqtt.Topics.Topic1 {
-		t.Errorf("Expected subscribe to topic %s, got %s", cfg.Mqtt.Topics.Topic1, mockClient.GetLastSubscribeTopic())
-	}
-
-	// サブスクライバーを停止
-	cancel()
-
-	// 少し待ってからエラーをチェック
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
+		// サブスクリプションが呼ばれたことを確認するフラグ
+		subscribed := false
+		mockClient.SubscribeFunc = func(topic string, qos byte, callback MQTT.MessageHandler) error {
+			if topic != cfg.Mqtt.Topics.Topic1 {
+				t.Errorf("期待されるトピック %s に対して %s がサブスクライブされた", cfg.Mqtt.Topics.Topic1, topic)
+			}
+			subscribed = true
+			return nil
 		}
-	case <-time.After(2 * time.Second):
-		t.Error("Timeout waiting for subscriber to stop")
-	}
+
+		// サブスクライバー作成
+		subscriber := NewSubscriber2(mockClient, cfg)
+
+		// コンテキスト作成（すぐにキャンセルされるタイマー）
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		// ゴルーチンでStart実行
+		errCh := make(chan error)
+		go func() {
+			errCh <- subscriber.Start(ctx)
+		}()
+
+		// エラーを確認
+		err := <-errCh
+		if err != context.DeadlineExceeded {
+			t.Errorf("context.DeadlineExceededエラーが期待されるが、%v だった", err)
+		}
+
+		// サブスクリプションが呼ばれたことを確認
+		if !subscribed {
+			t.Error("サブスクリプションが行われなかった")
+		}
+	})
+
+	t.Run("サブスクリプションエラー", func(t *testing.T) {
+		// モックMQTTクライアントの作成
+		mockClient := mqtt.NewMockClient()
+
+		// サブスクリプションでエラーを返すように設定
+		expectedErr := &mqtt.MockError{Message: "サブスクリプションエラー"}
+		mockClient.SubscribeFunc = func(topic string, qos byte, callback MQTT.MessageHandler) error {
+			return expectedErr
+		}
+
+		// サブスクライバー作成
+		subscriber := NewSubscriber2(mockClient, cfg)
+
+		// コンテキスト
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// 直接Start呼び出し
+		err := subscriber.Start(ctx)
+
+		// エラーを確認
+		if err == nil || err.Error() != "failed to subscribe: サブスクリプションエラー" {
+			t.Errorf("期待されるエラーと異なる: %v", err)
+		}
+	})
 }
 
-func TestMQTTSubscriber2_SubscribeError(t *testing.T) {
-	// テスト用の設定を準備
+func TestSubscriber2_MessageHandler(t *testing.T) {
+	// キャッシュの初期化
+	cache := cache.GetInstance()
+	cache.Clear() // テスト前にクリア
+
+	// テスト用のSub1データをキャッシュに追加
+	cache.Set("sub1:1", Sub1Props{ID: "1", Name: "sub1-test"})
+
+	// テスト用の設定
 	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
+		Mqtt: config.MqttSettings{
+			Topics: config.TopicConfig{
+				Topic1: "test/topic1",
+				Topic2: "test/topic2",
 			},
 		},
 	}
 
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
+	t.Run("Type 1のメッセージ処理", func(t *testing.T) {
+		// モックMQTTクライアントの作成
+		mockClient := mqtt.NewMockClient()
 
-	// サブスクライブエラーを設定
-	expectedErr := errors.New("subscribe failed")
-	mockClient.SetSubscribeError(expectedErr)
+		// パブリッシュ呼び出しをモニター
+		publishedTopics := make(map[string]bool)
+		mockClient.PublishFunc = func(topic string, qos byte, retained bool, payload string) error {
+			publishedTopics[topic] = true
+			return nil
+		}
 
-	// サブスクライバーを作成
-	subscriber := &MQTTSubscriber2{
-		client: mockClient,
-		cfg:    cfg,
-	}
+		// Subscribe呼び出しをキャプチャしてハンドラーを取得
+		var messageHandler MQTT.MessageHandler
+		mockClient.SubscribeFunc = func(topic string, qos byte, callback MQTT.MessageHandler) error {
+			messageHandler = callback
+			return nil
+		}
 
-	// エラーが正しく返されるか確認
-	err := subscriber.subscribe()
-	if err != expectedErr {
-		t.Errorf("Expected error %v, got %v", expectedErr, err)
-	}
+		// サブスクライバー作成
+		subscriber := NewSubscriber2(mockClient, cfg)
+
+		// コンテキスト
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Start呼び出し（サブスクリプション設定）
+		go subscriber.Start(ctx)
+
+		// ハンドラーが設定されるまで少し待機
+		time.Sleep(100 * time.Millisecond)
+
+		// テスト用のメッセージデータ（Type 1）
+		testProps := Sub2Props{
+			ID:   "1",
+			Name: "test-message-type1",
+			Type: 1,
+		}
+		payload, _ := json.Marshal(testProps)
+
+		// モックメッセージ作成
+		msg := &mockMessage{
+			topic:   cfg.Mqtt.Topics.Topic1,
+			payload: payload,
+		}
+
+		// メッセージハンドラー呼び出し
+		messageHandler(nil, msg)
+
+		// パブリッシュ先トピックの確認
+		if !publishedTopics[cfg.Mqtt.Topics.Topic1] {
+			t.Error("トピック1へのパブリッシュが行われなかった")
+		}
+		if publishedTopics[cfg.Mqtt.Topics.Topic2] {
+			t.Error("Type 1でトピック2へのパブリッシュが行われた")
+		}
+
+		// キャッシュのデータ確認
+		cacheKey := "sub2:1:1" // ID:1, Type:1
+		cachedData, exists := cache.Get(cacheKey)
+		if !exists {
+			t.Error("キャッシュにデータが保存されていない")
+		} else {
+			sub2Props, ok := cachedData.(Sub2Props)
+			if !ok {
+				t.Error("キャッシュに保存されたデータが正しい型でない")
+			} else if sub2Props.ID != "1" || sub2Props.Name != "test-message-type1" || sub2Props.Type != 1 {
+				t.Errorf("キャッシュに保存されたデータが期待値と異なる: %+v", sub2Props)
+			}
+		}
+	})
+
+	t.Run("Type 2のメッセージ処理", func(t *testing.T) {
+		// モックMQTTクライアントの作成
+		mockClient := mqtt.NewMockClient()
+
+		// パブリッシュ呼び出しをモニター
+		publishedTopics := make(map[string]bool)
+		mockClient.PublishFunc = func(topic string, qos byte, retained bool, payload string) error {
+			publishedTopics[topic] = true
+			return nil
+		}
+
+		// Subscribe呼び出しをキャプチャしてハンドラーを取得
+		var messageHandler MQTT.MessageHandler
+		mockClient.SubscribeFunc = func(topic string, qos byte, callback MQTT.MessageHandler) error {
+			messageHandler = callback
+			return nil
+		}
+
+		// サブスクライバー作成
+		subscriber := NewSubscriber2(mockClient, cfg)
+
+		// コンテキスト
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Start呼び出し（サブスクリプション設定）
+		go subscriber.Start(ctx)
+
+		// ハンドラーが設定されるまで少し待機
+		time.Sleep(100 * time.Millisecond)
+
+		// テスト用のメッセージデータ（Type 2）
+		testProps := Sub2Props{
+			ID:   "1",
+			Name: "test-message-type2",
+			Type: 2,
+		}
+		payload, _ := json.Marshal(testProps)
+
+		// モックメッセージ作成
+		msg := &mockMessage{
+			topic:   cfg.Mqtt.Topics.Topic1,
+			payload: payload,
+		}
+
+		// メッセージハンドラー呼び出し
+		messageHandler(nil, msg)
+
+		// パブリッシュ先トピックの確認
+		if !publishedTopics[cfg.Mqtt.Topics.Topic1] {
+			t.Error("トピック1へのパブリッシュが行われなかった")
+		}
+		if !publishedTopics[cfg.Mqtt.Topics.Topic2] {
+			t.Error("トピック2へのパブリッシュが行われなかった")
+		}
+
+		// キャッシュのデータ確認
+		cacheKey := "sub2:1:2" // ID:1, Type:2
+		cachedData, exists := cache.Get(cacheKey)
+		if !exists {
+			t.Error("キャッシュにデータが保存されていない")
+		} else {
+			sub2Props, ok := cachedData.(Sub2Props)
+			if !ok {
+				t.Error("キャッシュに保存されたデータが正しい型でない")
+			} else if sub2Props.ID != "1" || sub2Props.Name != "test-message-type2" || sub2Props.Type != 2 {
+				t.Errorf("キャッシュに保存されたデータが期待値と異なる: %+v", sub2Props)
+			}
+		}
+	})
 }
 
-func TestMQTTSubscriber2_MessageHandler_Type1(t *testing.T) {
-	// テスト用の設定を準備
+func TestSubscriber2_ProcessMessageByType(t *testing.T) {
+	// テスト用の設定
 	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
-				Topic2: "/test/topic2",
+		Mqtt: config.MqttSettings{
+			Topics: config.TopicConfig{
+				Topic1: "test/topic1",
+				Topic2: "test/topic2",
 			},
 		},
 	}
 
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
+	// モックMQTTクライアントの作成
+	mockClient := mqtt.NewMockClient()
 
-	// サブスクライバーを作成
-	subscriber := &MQTTSubscriber2{
-		client: mockClient,
-		cfg:    cfg,
-	}
+	// サブスクライバー作成
+	sub2 := NewSubscriber2(mockClient, cfg).(*MQTTSubscriber2)
 
-	// メッセージハンドラーを作成
-	handler := subscriber.createMessageHandler()
+	t.Run("Type 1のメッセージ処理", func(t *testing.T) {
+		// パブリッシュ呼び出しをモニター
+		publishedTopics := make(map[string]bool)
+		mockClient.PublishFunc = func(topic string, qos byte, retained bool, payload string) error {
+			publishedTopics[topic] = true
+			return nil
+		}
 
-	// Type 1のテストメッセージを作成
-	testProps := Sub2Props{
-		ID:   "test-id",
-		Name: "test-name",
-		Type: 1,
-	}
-	payload, _ := json.Marshal(testProps)
+		// テスト用のメッセージデータ
+		testProps := Sub2Props{
+			ID:   "1",
+			Name: "test-message-type1",
+			Type: 1,
+		}
 
-	// メッセージ受信をシミュレート - 修正したMockMessageの使い方
-	message := &mqttutil.MockMessage{
-		Topic1:   cfg.Mqtt.Topics.Topic1,
-		Payload1: payload,
-	}
-	handler(nil, message)
+		// processMessageByTypeの呼び出し
+		err := sub2.processMessageByType(testProps, true, Sub1Props{ID: "1", Name: "sub1-test"})
 
-	// Type 1のメッセージはTopic1にのみパブリッシュされるはず
-	if mockClient.GetPublishCount() != 1 {
-		t.Errorf("Expected 1 publish call for Type 1, got %d", mockClient.GetPublishCount())
-	}
+		// エラーがないことを確認
+		if err != nil {
+			t.Errorf("processMessageByTypeがエラーを返した: %v", err)
+		}
 
-	if mockClient.GetLastPublishTopic() != cfg.Mqtt.Topics.Topic1 {
-		t.Errorf("Expected publish to topic %s, got %s", cfg.Mqtt.Topics.Topic1, mockClient.GetLastPublishTopic())
-	}
-}
+		// パブリッシュ先トピックの確認
+		if !publishedTopics[cfg.Mqtt.Topics.Topic1] {
+			t.Error("トピック1へのパブリッシュが行われなかった")
+		}
+		if publishedTopics[cfg.Mqtt.Topics.Topic2] {
+			t.Error("Type 1でトピック2へのパブリッシュが行われた")
+		}
+	})
 
-func TestMQTTSubscriber2_MessageHandler_Type2(t *testing.T) {
-	// テスト用の設定を準備
-	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
-				Topic2: "/test/topic2",
-			},
-		},
-	}
+	t.Run("Type 2のメッセージ処理", func(t *testing.T) {
+		// パブリッシュ呼び出しをリセット
+		publishedTopics := make(map[string]bool)
+		mockClient.PublishFunc = func(topic string, qos byte, retained bool, payload string) error {
+			publishedTopics[topic] = true
+			return nil
+		}
 
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
+		// テスト用のメッセージデータ
+		testProps := Sub2Props{
+			ID:   "1",
+			Name: "test-message-type2",
+			Type: 2,
+		}
 
-	// サブスクライバーを作成
-	subscriber := &MQTTSubscriber2{
-		client: mockClient,
-		cfg:    cfg,
-	}
+		// processMessageByTypeの呼び出し
+		err := sub2.processMessageByType(testProps, true, Sub1Props{ID: "1", Name: "sub1-test"})
 
-	// メッセージハンドラーを作成
-	handler := subscriber.createMessageHandler()
+		// エラーがないことを確認
+		if err != nil {
+			t.Errorf("processMessageByTypeがエラーを返した: %v", err)
+		}
 
-	// Type 2のテストメッセージを作成
-	testProps := Sub2Props{
-		ID:   "test-id",
-		Name: "test-name",
-		Type: 2,
-	}
-	payload, _ := json.Marshal(testProps)
+		// パブリッシュ先トピックの確認
+		if !publishedTopics[cfg.Mqtt.Topics.Topic1] {
+			t.Error("トピック1へのパブリッシュが行われなかった")
+		}
+		if !publishedTopics[cfg.Mqtt.Topics.Topic2] {
+			t.Error("トピック2へのパブリッシュが行われなかった")
+		}
+	})
 
-	// メッセージ受信をシミュレート - 修正したMockMessageの使い方
-	message := &mqttutil.MockMessage{
-		Topic1:   cfg.Mqtt.Topics.Topic1,
-		Payload1: payload,
-	}
-	handler(nil, message)
+	t.Run("不明なタイプのエラー処理", func(t *testing.T) {
+		// パブリッシュ呼び出しをリセット
+		publishedTopics := make(map[string]bool)
+		mockClient.PublishFunc = func(topic string, qos byte, retained bool, payload string) error {
+			publishedTopics[topic] = true
+			return nil
+		}
 
-	// Type 2のメッセージはTopic1とTopic2の両方にパブリッシュされるはず
-	if mockClient.GetPublishCount() != 2 {
-		t.Errorf("Expected 2 publish calls for Type 2, got %d", mockClient.GetPublishCount())
-	}
-}
+		// テスト用のメッセージデータ（不明なタイプ）
+		testProps := Sub2Props{
+			ID:   "1",
+			Name: "test-message-unknown-type",
+			Type: 999, // 未定義のタイプ
+		}
 
-func TestMQTTSubscriber2_MessageHandler_InvalidJSON(t *testing.T) {
-	// テスト用の設定を準備
-	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
-				Topic2: "/test/topic2",
-			},
-		},
-	}
+		// processMessageByTypeの呼び出し
+		err := sub2.processMessageByType(testProps, false, nil)
 
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
+		// エラーを確認
+		if err == nil {
+			t.Error("不明なタイプでエラーが返されなかった")
+		} else if err.Error() != "unknown message type: 999" {
+			t.Errorf("期待されるエラーと異なる: %v", err)
+		}
 
-	// サブスクライバーを作成
-	subscriber := &MQTTSubscriber2{
-		client: mockClient,
-		cfg:    cfg,
-	}
+		// パブリッシュが行われないことを確認
+		if len(publishedTopics) > 0 {
+			t.Error("不明なタイプでパブリッシュが行われた")
+		}
+	})
 
-	// メッセージハンドラーを作成
-	handler := subscriber.createMessageHandler()
+	t.Run("パブリッシュエラーの処理", func(t *testing.T) {
+		// パブリッシュでエラーを返すように設定
+		expectedErr := &mqtt.MockError{Message: "パブリッシュエラー"}
+		mockClient.PublishFunc = func(topic string, qos byte, retained bool, payload string) error {
+			return expectedErr
+		}
 
-	// 無効なJSONデータでメッセージ受信をシミュレート
-	invalidJSON := []byte("{invalid json}")
-	message := &mqttutil.MockMessage{
-		Topic1:   cfg.Mqtt.Topics.Topic1,
-		Payload1: invalidJSON,
-	}
+		// テスト用のメッセージデータ
+		testProps := Sub2Props{
+			ID:   "1",
+			Name: "test-message-type1",
+			Type: 1,
+		}
 
-	// ハンドラーを呼び出す
-	handler(nil, message)
+		// processMessageByTypeの呼び出し
+		err := sub2.processMessageByType(testProps, false, nil)
 
-	// JSON解析エラーのため、メッセージは処理されず、パブリッシュは呼ばれないはず
-	if mockClient.GetPublishCount() != 0 {
-		t.Errorf("Expected 0 publish calls for invalid JSON, got %d", mockClient.GetPublishCount())
-	}
-}
-
-func TestMQTTSubscriber2_MessageHandler_UnknownType(t *testing.T) {
-	// テスト用の設定を準備
-	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
-				Topic2: "/test/topic2",
-			},
-		},
-	}
-
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
-
-	// サブスクライバーを作成
-	subscriber := &MQTTSubscriber2{
-		client: mockClient,
-		cfg:    cfg,
-	}
-
-	// メッセージハンドラーを作成
-	handler := subscriber.createMessageHandler()
-
-	// 未知のTypeを持つテストメッセージを作成
-	testProps := Sub2Props{
-		ID:   "test-id",
-		Name: "test-name",
-		Type: 999, // 未知のタイプ
-	}
-	payload, _ := json.Marshal(testProps)
-
-	// メッセージ受信をシミュレート
-	message := &mqttutil.MockMessage{
-		Topic1:   cfg.Mqtt.Topics.Topic1,
-		Payload1: payload,
-	}
-	handler(nil, message)
-
-	// 未知のType値のため、メッセージは処理されず、パブリッシュは呼ばれないはず
-	if mockClient.GetPublishCount() != 0 {
-		t.Errorf("Expected 0 publish calls for unknown Type, got %d", mockClient.GetPublishCount())
-	}
+		// エラーを確認
+		if err == nil {
+			t.Error("パブリッシュエラーが返されなかった")
+		} else if err.Error() != "failed to publish to topic1: パブリッシュエラー" {
+			t.Errorf("期待されるエラーと異なる: %v", err)
+		}
+	})
 }

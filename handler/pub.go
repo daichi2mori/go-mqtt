@@ -48,7 +48,7 @@ func (p *MQTTPublisher) Start(ctx context.Context) error {
 		fmt.Println("Publisher received notification from Sub1, starting publishing cycle")
 	case <-ctx.Done():
 		fmt.Println("Publisher shutting down before receiving any messages")
-		return nil
+		return ctx.Err()
 	}
 
 	// Sub1がメッセージを受信したら、定期的にメッセージのパブリッシュを開始
@@ -57,23 +57,21 @@ func (p *MQTTPublisher) Start(ctx context.Context) error {
 
 	// 最初に1回パブリッシュ
 	if err := p.publishMessage(); err != nil {
-		fmt.Println("Initial publish error:", err)
+		return fmt.Errorf("initial publish failed: %w", err)
 	}
 
-LOOP:
 	for {
 		select {
 		case <-ticker.C:
 			if err := p.publishMessage(); err != nil {
-				fmt.Println("Publish error:", err)
+				fmt.Printf("Publish error: %v\n", err)
+				// エラーがあっても処理を続行
 			}
 		case <-ctx.Done():
-			break LOOP
+			fmt.Println("Pub quit")
+			return ctx.Err()
 		}
 	}
-
-	fmt.Println("Pub quit")
-	return nil
 }
 
 // publishMessage は単一のメッセージをパブリッシュします
@@ -84,8 +82,7 @@ func (p *MQTTPublisher) publishMessage() error {
 		Name: "test",
 	}
 
-	// キャッシュからデータを取得する例
-	// キーは予想されるフォーマットに基づいています
+	// キャッシュからデータを取得
 	sub1Key := "sub1:1" // IDが1のSub1データ
 	sub1Data, exists := cache.GetInstance().Get(sub1Key)
 	if exists {
@@ -93,20 +90,18 @@ func (p *MQTTPublisher) publishMessage() error {
 		// ここでキャッシュから取得したデータを利用できます
 	}
 
-	// キャッシュにも保存します
+	// キャッシュに保存
 	cacheKey := fmt.Sprintf("pub:%s", req.ID)
 	cache.GetInstance().Set(cacheKey, req)
 
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	return p.client.Publish(p.cfg.Mqtt.Topics.Topic3, 0, false, string(payload))
-}
+	if err := p.client.Publish(p.cfg.Mqtt.Topics.Topic3, 0, false, string(payload)); err != nil {
+		return fmt.Errorf("failed to publish message: %w", err)
+	}
 
-// 後方互換性のためのラッパー関数
-func Pub(ctx context.Context, client mqttutil.MQTTClient, cfg *config.MqttConfig, messageReceived <-chan struct{}) error {
-	publisher := NewPublisher(client, cfg, messageReceived)
-	return publisher.Start(ctx)
+	return nil
 }

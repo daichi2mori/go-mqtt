@@ -1,176 +1,69 @@
 package mqttutil
 
 import (
-	"sync"
-
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 )
 
-// MockMQTTClient はテスト用のモッククライアントです
-type MockMQTTClient struct {
-	connected      bool
-	publishCalled  int
-	publishTopic   string
-	publishPayload interface{}
-	publishError   error
-
-	subscribeCalled  int
-	subscribeTopic   string
-	subscribeHandler MQTT.MessageHandler
-	subscribeError   error
-
-	mu sync.Mutex
+// MockClient はMQTTClientのモック実装です
+type MockClient struct {
+	ConnectFunc     func() error
+	DisconnectFunc  func(quiesce uint)
+	PublishFunc     func(topic string, qos byte, retained bool, payload string) error
+	SubscribeFunc   func(topic string, qos byte, callback MQTT.MessageHandler) error
+	UnsubscribeFunc func(topics []string) error
 }
 
-// NewMockClient は新しいモッククライアントを作成します
-func NewMockClient() *MockMQTTClient {
-	return &MockMQTTClient{
-		connected: false,
+// MockError はテスト用のエラー型です
+type MockError struct {
+	Message string
+}
+
+func (e *MockError) Error() string {
+	return e.Message
+}
+
+// NewMockClient は新しいモックMQTTクライアントを作成します
+func NewMockClient() *MockClient {
+	return &MockClient{
+		ConnectFunc: func() error {
+			return nil
+		},
+		DisconnectFunc: func(quiesce uint) {
+			// 何もしない
+		},
+		PublishFunc: func(topic string, qos byte, retained bool, payload string) error {
+			return nil
+		},
+		SubscribeFunc: func(topic string, qos byte, callback MQTT.MessageHandler) error {
+			return nil
+		},
+		UnsubscribeFunc: func(topics []string) error {
+			return nil
+		},
 	}
 }
 
-// Connect はモックの接続操作をシミュレートします
-func (m *MockMQTTClient) Connect() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.connected = true
-	return nil
+// Connect はモックの接続処理です
+func (m *MockClient) Connect() error {
+	return m.ConnectFunc()
 }
 
-// Disconnect はモックの切断操作をシミュレートします
-func (m *MockMQTTClient) Disconnect(quiesce uint) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.connected = false
+// Disconnect はモックの切断処理です
+func (m *MockClient) Disconnect(quiesce uint) {
+	m.DisconnectFunc(quiesce)
 }
 
-// IsConnected は接続状態を返します
-func (m *MockMQTTClient) IsConnected() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.connected
+// Publish はモックのパブリッシュ処理です
+func (m *MockClient) Publish(topic string, qos byte, retained bool, payload string) error {
+	return m.PublishFunc(topic, qos, retained, payload)
 }
 
-// Publish はモックのパブリッシュ操作をシミュレートします
-func (m *MockMQTTClient) Publish(topic string, qos byte, retained bool, payload interface{}) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.publishCalled++
-	m.publishTopic = topic
-	m.publishPayload = payload
-	return m.publishError
+// Subscribe はモックのサブスクライブ処理です
+func (m *MockClient) Subscribe(topic string, qos byte, callback MQTT.MessageHandler) error {
+	return m.SubscribeFunc(topic, qos, callback)
 }
 
-// SetPublishError はパブリッシュ時に返すエラーを設定します
-func (m *MockMQTTClient) SetPublishError(err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.publishError = err
-}
-
-// GetPublishCount はパブリッシュが呼ばれた回数を返します
-func (m *MockMQTTClient) GetPublishCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.publishCalled
-}
-
-// GetLastPublishTopic は最後にパブリッシュされたトピックを返します
-func (m *MockMQTTClient) GetLastPublishTopic() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.publishTopic
-}
-
-// GetLastPublishPayload は最後にパブリッシュされたペイロードを返します
-func (m *MockMQTTClient) GetLastPublishPayload() interface{} {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.publishPayload
-}
-
-// Subscribe はモックのサブスクライブ操作をシミュレートします
-func (m *MockMQTTClient) Subscribe(topic string, qos byte, callback MQTT.MessageHandler) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.subscribeCalled++
-	m.subscribeTopic = topic
-	m.subscribeHandler = callback
-	return m.subscribeError
-}
-
-// SetSubscribeError はサブスクライブ時に返すエラーを設定します
-func (m *MockMQTTClient) SetSubscribeError(err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.subscribeError = err
-}
-
-// GetSubscribeCount はサブスクライブが呼ばれた回数を返します
-func (m *MockMQTTClient) GetSubscribeCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.subscribeCalled
-}
-
-// GetLastSubscribeTopic は最後にサブスクライブされたトピックを返します
-func (m *MockMQTTClient) GetLastSubscribeTopic() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.subscribeTopic
-}
-
-// GetSubscribeHandler は設定されたハンドラーを返します
-func (m *MockMQTTClient) GetSubscribeHandler() MQTT.MessageHandler {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.subscribeHandler
-}
-
-// SimulateMessage はサブスクライブしたトピックにメッセージが来たことをシミュレートします
-func (m *MockMQTTClient) SimulateMessage(topic string, payload []byte) {
-	m.mu.Lock()
-	handler := m.subscribeHandler
-	m.mu.Unlock()
-
-	if handler != nil && m.subscribeTopic == topic {
-		handler(nil, &MockMessage{
-			Topic1:   topic,
-			Payload1: payload,
-		})
-	}
-}
-
-// MockMessage はMQTTメッセージのモック実装です
-type MockMessage struct {
-	Topic1   string
-	Payload1 []byte
-}
-
-func (m *MockMessage) Duplicate() bool {
-	return false
-}
-
-func (m *MockMessage) Qos() byte {
-	return 0
-}
-
-func (m *MockMessage) Retained() bool {
-	return false
-}
-
-func (m *MockMessage) Topic() string {
-	return m.Topic1
-}
-
-func (m *MockMessage) MessageID() uint16 {
-	return 1
-}
-
-func (m *MockMessage) Payload() []byte {
-	return m.Payload1
-}
-
-func (m *MockMessage) Ack() {
-	// 何もしない
+// Unsubscribe はモックのアンサブスクライブ処理です
+func (m *MockClient) Unsubscribe(topics []string) error {
+	return m.UnsubscribeFunc(topics)
 }

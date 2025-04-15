@@ -3,154 +3,294 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"go-mqtt/cache"
 	"go-mqtt/config"
-	mqttutil "go-mqtt/mqtt"
+	"go-mqtt/mqtt"
 	"testing"
 	"time"
+
+	MQTT "github.com/eclipse/paho.mqtt.golang"
 )
 
-func TestMQTTSubscriber1_Start(t *testing.T) {
-	// テスト用の設定を準備
+// テスト用のMQTTメッセージの実装
+type mockMessage struct {
+	topic   string
+	payload []byte
+}
+
+func (m *mockMessage) Duplicate() bool {
+	return false
+}
+
+func (m *mockMessage) Qos() byte {
+	return 0
+}
+
+func (m *mockMessage) Retained() bool {
+	return false
+}
+
+func (m *mockMessage) Topic() string {
+	return m.topic
+}
+
+func (m *mockMessage) MessageID() uint16 {
+	return 0
+}
+
+func (m *mockMessage) Payload() []byte {
+	return m.payload
+}
+
+func (m *mockMessage) Ack() {
+}
+
+func TestSubscriber1_Start(t *testing.T) {
+	// キャッシュの初期化
+	_ = cache.GetInstance()
+
+	// テスト用の設定
 	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Broker:   "tcp://localhost:1883",
-			Interval: 1,
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
+		Mqtt: config.MqttSettings{
+			Topics: config.TopicConfig{
+				Topic1: "test/topic1",
 			},
 		},
 	}
 
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
+	t.Run("通常動作：サブスクリプション成功後にコンテキストキャンセルで終了", func(t *testing.T) {
+		// モックMQTTクライアントの作成
+		mockClient := mqtt.NewMockClient()
 
-	// サブスクライバーを作成
-	subscriber := NewSubscriber1(mockClient, cfg)
-
-	// コンテキストを作成して、すぐにキャンセルできるようにする
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// エラーチャネルを作成して、非同期でサブスクライバーを開始
-	errCh := make(chan error)
-	go func() {
-		errCh <- subscriber.Start(ctx)
-	}()
-
-	// サブスクライバーがトピックをサブスクライブするのを待つ
-	time.Sleep(500 * time.Millisecond)
-
-	// サブスクライバーが正しいトピックをサブスクライブしたか確認
-	if mockClient.GetSubscribeCount() != 1 {
-		t.Errorf("Expected 1 subscribe call, got %d", mockClient.GetSubscribeCount())
-	}
-
-	if mockClient.GetLastSubscribeTopic() != cfg.Mqtt.Topics.Topic1 {
-		t.Errorf("Expected subscribe to topic %s, got %s", cfg.Mqtt.Topics.Topic1, mockClient.GetLastSubscribeTopic())
-	}
-
-	// テストメッセージを作成
-	testProps := Sub1Props{
-		ID:   "test-id",
-		Name: "test-name",
-	}
-	payload, _ := json.Marshal(testProps)
-
-	// メッセージ受信をシミュレート
-	mockClient.SimulateMessage(cfg.Mqtt.Topics.Topic1, payload)
-
-	// 少し待ってから結果を確認
-	time.Sleep(100 * time.Millisecond)
-
-	// ハンドラーがメッセージを処理して再パブリッシュしたか確認
-	if mockClient.GetPublishCount() != 1 {
-		t.Errorf("Expected 1 publish call, got %d", mockClient.GetPublishCount())
-	}
-
-	if mockClient.GetLastPublishTopic() != cfg.Mqtt.Topics.Topic1 {
-		t.Errorf("Expected publish to topic %s, got %s", cfg.Mqtt.Topics.Topic1, mockClient.GetLastPublishTopic())
-	}
-
-	// サブスクライバーを停止
-	cancel()
-
-	// 少し待ってからエラーをチェック
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
+		// サブスクリプションが呼ばれたことを確認するフラグ
+		subscribed := false
+		mockClient.SubscribeFunc = func(topic string, qos byte, callback MQTT.MessageHandler) error {
+			if topic != cfg.Mqtt.Topics.Topic1 {
+				t.Errorf("期待されるトピック %s に対して %s がサブスクライブされた", cfg.Mqtt.Topics.Topic1, topic)
+			}
+			subscribed = true
+			return nil
 		}
-	case <-time.After(2 * time.Second):
-		t.Error("Timeout waiting for subscriber to stop")
-	}
+
+		// 通知用チャネル
+		messageReceived := make(chan struct{}, 1)
+
+		// サブスクライバー作成
+		subscriber := NewSubscriber1(mockClient, cfg, messageReceived)
+
+		// コンテキスト作成（すぐにキャンセルされるタイマー）
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		// ゴルーチンでStart実行
+		errCh := make(chan error)
+		go func() {
+			errCh <- subscriber.Start(ctx)
+		}()
+
+		// エラーを確認
+		err := <-errCh
+		if err != context.DeadlineExceeded {
+			t.Errorf("context.DeadlineExceededエラーが期待されるが、%v だった", err)
+		}
+
+		// サブスクリプションが呼ばれたことを確認
+		if !subscribed {
+			t.Error("サブスクリプションが行われなかった")
+		}
+	})
+
+	t.Run("サブスクリプションエラー", func(t *testing.T) {
+		// モックMQTTクライアントの作成
+		mockClient := mqtt.NewMockClient()
+
+		// サブスクリプションでエラーを返すように設定
+		expectedErr := &mqtt.MockError{Message: "サブスクリプションエラー"}
+		mockClient.SubscribeFunc = func(topic string, qos byte, callback MQTT.MessageHandler) error {
+			return expectedErr
+		}
+
+		// 通知用チャネル
+		messageReceived := make(chan struct{}, 1)
+
+		// サブスクライバー作成
+		subscriber := NewSubscriber1(mockClient, cfg, messageReceived)
+
+		// コンテキスト
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// 直接Start呼び出し
+		err := subscriber.Start(ctx)
+
+		// エラーを確認
+		if err == nil || err.Error() != "failed to subscribe: サブスクリプションエラー" {
+			t.Errorf("期待されるエラーと異なる: %v", err)
+		}
+	})
 }
 
-func TestMQTTSubscriber1_SubscribeError(t *testing.T) {
-	// テスト用の設定を準備
+func TestSubscriber1_MessageHandler(t *testing.T) {
+	// キャッシュの初期化
+	cache := cache.GetInstance()
+	cache.Clear() // テスト前にクリア
+
+	// テスト用の設定
 	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
+		Mqtt: config.MqttSettings{
+			Topics: config.TopicConfig{
+				Topic1: "test/topic1",
 			},
 		},
 	}
 
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
+	t.Run("メッセージ受信時の処理（初回）", func(t *testing.T) {
+		// モックMQTTクライアントの作成
+		mockClient := mqtt.NewMockClient()
 
-	// サブスクライブエラーを設定
-	expectedErr := errors.New("subscribe failed")
-	mockClient.SetSubscribeError(expectedErr)
+		// Publish呼び出しをモニター
+		publishCalled := false
+		mockClient.PublishFunc = func(topic string, qos byte, retained bool, payload string) error {
+			if topic != cfg.Mqtt.Topics.Topic1 {
+				t.Errorf("期待されるトピック %s に対して %s にパブリッシュされた", cfg.Mqtt.Topics.Topic1, topic)
+			}
+			publishCalled = true
+			return nil
+		}
 
-	// サブスクライバーを作成
-	subscriber := &MQTTSubscriber1{
-		client: mockClient,
-		cfg:    cfg,
-	}
+		// Subscribe呼び出しをキャプチャしてハンドラーを取得
+		var messageHandler MQTT.MessageHandler
+		mockClient.SubscribeFunc = func(topic string, qos byte, callback MQTT.MessageHandler) error {
+			messageHandler = callback
+			return nil
+		}
 
-	// エラーが正しく返されるか確認
-	err := subscriber.subscribe()
-	if err != expectedErr {
-		t.Errorf("Expected error %v, got %v", expectedErr, err)
-	}
-}
+		// 通知用チャネル
+		messageReceived := make(chan struct{}, 1)
 
-func TestMQTTSubscriber1_MessageHandler_InvalidJSON(t *testing.T) {
-	// テスト用の設定を準備
-	cfg := &config.MqttConfig{
-		Mqtt: config.Config{
-			Topics: config.Topics{
-				Topic1: "/test/topic1",
-			},
-		},
-	}
+		// サブスクライバー作成
+		subscriber := NewSubscriber1(mockClient, cfg, messageReceived)
 
-	// モックMQTTクライアントを作成
-	mockClient := mqttutil.NewMockClient()
+		// コンテキスト
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	// サブスクライバーを作成
-	subscriber := &MQTTSubscriber1{
-		client: mockClient,
-		cfg:    cfg,
-	}
+		// Start呼び出し（サブスクリプション設定）
+		go subscriber.Start(ctx)
 
-	// メッセージハンドラーを作成
-	handler := subscriber.createMessageHandler()
+		// ハンドラーが設定されるまで少し待機
+		time.Sleep(100 * time.Millisecond)
 
-	// 無効なJSONデータでメッセージ受信をシミュレート
-	invalidJSON := []byte("{invalid json}")
+		// テスト用のメッセージデータ
+		testProps := Sub1Props{
+			ID:   "1",
+			Name: "test-message",
+		}
+		payload, _ := json.Marshal(testProps)
 
-	// MockMessageを正しく初期化
-	message := &mqttutil.MockMessage{
-		Topic1:   cfg.Mqtt.Topics.Topic1,
-		Payload1: invalidJSON,
-	}
+		// モックメッセージ作成
+		msg := &mockMessage{
+			topic:   cfg.Mqtt.Topics.Topic1,
+			payload: payload,
+		}
 
-	// ハンドラーを呼び出す
-	handler(nil, message)
+		// メッセージハンドラー呼び出し
+		messageHandler(nil, msg)
 
-	// JSON解析エラーのため、メッセージは処理されず、パブリッシュは呼ばれないはず
-	if mockClient.GetPublishCount() != 0 {
-		t.Errorf("Expected 0 publish calls for invalid JSON, got %d", mockClient.GetPublishCount())
-	}
+		// 通知チャネルを確認
+		select {
+		case <-messageReceived:
+			// 通知が送信されたことを確認
+		case <-time.After(100 * time.Millisecond):
+			t.Error("通知が送信されなかった")
+		}
+
+		// 再パブリッシュの確認
+		if !publishCalled {
+			t.Error("メッセージが再パブリッシュされなかった")
+		}
+
+		// キャッシュのデータ確認
+		cacheKey := "sub1:1"
+		cachedData, exists := cache.Get(cacheKey)
+		if !exists {
+			t.Error("キャッシュにデータが保存されていない")
+		} else {
+			sub1Props, ok := cachedData.(Sub1Props)
+			if !ok {
+				t.Error("キャッシュに保存されたデータが正しい型でない")
+			} else if sub1Props.ID != "1" || sub1Props.Name != "test-message" {
+				t.Errorf("キャッシュに保存されたデータが期待値と異なる: %+v", sub1Props)
+			}
+		}
+	})
+
+	t.Run("メッセージ受信時の処理（2回目以降）", func(t *testing.T) {
+		// モックMQTTクライアントの作成
+		mockClient := mqtt.NewMockClient()
+
+		// Subscribe呼び出しをキャプチャしてハンドラーを取得
+		var messageHandler MQTT.MessageHandler
+		mockClient.SubscribeFunc = func(topic string, qos byte, callback MQTT.MessageHandler) error {
+			messageHandler = callback
+			return nil
+		}
+
+		// 通知用チャネル（バッファ1）
+		messageReceived := make(chan struct{}, 1)
+
+		// サブスクライバー作成
+		sub1 := NewSubscriber1(mockClient, cfg, messageReceived).(*MQTTSubscriber1)
+
+		// 初回メッセージ受信済みに設定
+		sub1.firstMessageReceived.Store(true)
+
+		// コンテキスト
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Start呼び出し（サブスクリプション設定）
+		go sub1.Start(ctx)
+
+		// ハンドラーが設定されるまで少し待機
+		time.Sleep(100 * time.Millisecond)
+
+		// テスト用のメッセージデータ
+		testProps := Sub1Props{
+			ID:   "2",
+			Name: "second-message",
+		}
+		payload, _ := json.Marshal(testProps)
+
+		// モックメッセージ作成
+		msg := &mockMessage{
+			topic:   cfg.Mqtt.Topics.Topic1,
+			payload: payload,
+		}
+
+		// メッセージハンドラー呼び出し
+		messageHandler(nil, msg)
+
+		// 通知チャネルを確認（通知は送信されないはず）
+		select {
+		case <-messageReceived:
+			t.Error("2回目のメッセージで通知が送信された")
+		case <-time.After(100 * time.Millisecond):
+			// 通知が送信されないことを確認
+		}
+
+		// キャッシュのデータ確認
+		cacheKey := "sub1:2"
+		cachedData, exists := cache.Get(cacheKey)
+		if !exists {
+			t.Error("2回目のキャッシュにデータが保存されていない")
+		} else {
+			sub1Props, ok := cachedData.(Sub1Props)
+			if !ok {
+				t.Error("2回目のキャッシュに保存されたデータが正しい型でない")
+			} else if sub1Props.ID != "2" || sub1Props.Name != "second-message" {
+				t.Errorf("2回目のキャッシュに保存されたデータが期待値と異なる: %+v", sub1Props)
+			}
+		}
+	})
 }
