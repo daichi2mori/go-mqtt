@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"go-mqtt/cache"
+	"go-mqtt/config"
+	"go-mqtt/handler"
 	mqttutil "go-mqtt/mqtt"
 	"log"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 )
 
@@ -19,38 +22,28 @@ const (
 )
 
 func main() {
-	// 共有MQTTクライアントの取得
-	client, err := mqttutil.GetClient(brokerURL, clientID, username, password)
+	cfg, err := config.LoadConfig()
 	if err != nil {
-		log.Fatalf("Failed to get MQTT client: %v", err)
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	var wg sync.WaitGroup
+	// キャッシュの初期化
+	_ = cache.GetInstance()
+	fmt.Println("Cache initialized")
 
-	// サブスクライバーを開始
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		if err := startSubscriber1(client); err != nil {
-			fmt.Printf("Subscriber1 error: %v\n", err)
-		}
-	}()
+	client := mqttutil.NewClient(cfg)
 
-	go func() {
-		defer wg.Done()
-		if err := startSubscriber2(client); err != nil {
-			fmt.Printf("Subscriber2 error: %v\n", err)
-		}
-	}()
+	ctx, cancel := context.WithCancel(context.Background())
 
-	// 100ms毎にパブリッシュする処理を開始
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := startPeriodicPublisher(client); err != nil {
-			fmt.Printf("Periodic publisher error: %v\n", err)
-		}
-	}()
+	// Sub1からのメッセージ受信を通知するチャネルを作成
+	messageReceived := make(chan struct{}, 1)
+
+	// Sub1とSub2を起動
+	go handler.Sub1(ctx, client, cfg, messageReceived)
+	go handler.Sub2(ctx, client, cfg)
+	
+	// Pubは、Sub1がメッセージを受信した後に開始するよう変更
+	go handler.Pub(ctx, client, cfg, messageReceived)
 
 	// シグナル処理（Ctrl+Cなど）
 	sigChan := make(chan os.Signal, 1)
@@ -58,14 +51,7 @@ func main() {
 	<-sigChan
 
 	fmt.Println("Shutting down...")
-
-	// MQTTクライアントを切断
-	if client.IsConnected() {
-		client.Disconnect(250)
-		fmt.Println("MQTT client disconnected")
-	}
-
-	// すべてのゴルーチンが終了するのを待つ
-	wg.Wait()
+	cancel()
+	client.Disconnect(250)
 	fmt.Println("All tasks completed, exiting")
 }

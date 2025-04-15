@@ -1,0 +1,7 @@
+mqtt:
+  broker: "tcp://127.0.0.1:1883"
+  interval: 1
+  topics:
+    topic1: "/topic1"
+    topic2: "/topic2"
+    topic3: "/topic3"

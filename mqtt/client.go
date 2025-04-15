@@ -2,77 +2,86 @@ package mqttutil
 
 import (
 	"fmt"
-	"log"
+	"go-mqtt/config"
 	"sync"
 
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 )
 
-var (
-	client     MQTT.Client
-	clientOnce sync.Once
-	mutex      sync.Mutex
-)
-
-// GetClient はシングルトンのMQTTクライアントを返します
-func GetClient(brokerURL, clientID, username, password string) (MQTT.Client, error) {
-	clientOnce.Do(func() {
-		// MQTTクライアントオプションの設定
-		opts := MQTT.NewClientOptions()
-		opts.AddBroker(brokerURL)
-		opts.SetClientID(clientID)
-		opts.SetUsername(username)
-		opts.SetPassword(password)
-		opts.SetAutoReconnect(true)
-		opts.SetMaxReconnectInterval(5000)
-
-		// 接続時のコールバック
-		opts.SetOnConnectHandler(func(client MQTT.Client) {
-			log.Println("Connected to MQTT broker")
-		})
-
-		// 接続失敗時のコールバック
-		opts.SetConnectionLostHandler(func(client MQTT.Client, err error) {
-			log.Printf("Connection lost: %v", err)
-		})
-
-		// MQTTクライアントの作成
-		client = MQTT.NewClient(opts)
-
-		// ブローカーに接続
-		if token := client.Connect(); token.Wait() && token.Error() != nil {
-			log.Printf("Failed to connect to MQTT broker: %v", token.Error())
-		}
-	})
-
-	if !client.IsConnected() {
-		return nil, fmt.Errorf("MQTT client is not connected")
-	}
-
-	return client, nil
+// MQTTClient はMQTTクライアントの操作を定義するインターフェースです
+type MQTTClient interface {
+	Connect() error
+	Disconnect(quiesce uint)
+	IsConnected() bool
+	Publish(topic string, qos byte, retained bool, payload interface{}) error
+	Subscribe(topic string, qos byte, callback MQTT.MessageHandler) error
 }
 
-// Subscribe はトピックをサブスクライブします
-func Subscribe(client MQTT.Client, topic string, qos byte, callback MQTT.MessageHandler) error {
-	mutex.Lock()
-	defer mutex.Unlock()
+// PahoMQTTClient は実際のMQTTクライアントの実装です
+type PahoMQTTClient struct {
+	client MQTT.Client
+	mutex  sync.Mutex
+}
 
-	if token := client.Subscribe(topic, qos, callback); token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to subscribe to topic %s: %v", topic, token.Error())
+var (
+	clientOnce sync.Once
+)
+
+func onConnectHandler(c MQTT.Client) {
+	fmt.Println("接続された")
+}
+
+// NewClient は新しいMQTTクライアントを作成します
+func NewClient(cfg *config.MqttConfig) MQTTClient {
+	opts := MQTT.NewClientOptions().AddBroker(cfg.Mqtt.Broker).SetOnConnectHandler(onConnectHandler)
+	client := MQTT.NewClient(opts)
+
+	mqttClient := &PahoMQTTClient{
+		client: client,
 	}
 
-	log.Printf("Subscribed to topic: %s", topic)
+	return mqttClient
+}
+
+// Connect はMQTTブローカーに接続します
+func (c *PahoMQTTClient) Connect() error {
+	token := c.client.Connect()
+	if token.Wait() && token.Error() != nil {
+		return token.Error()
+	}
 	return nil
 }
 
+// Disconnect はMQTTブローカーから切断します
+func (c *PahoMQTTClient) Disconnect(quiesce uint) {
+	c.client.Disconnect(quiesce)
+}
+
+// IsConnected は接続状態を返します
+func (c *PahoMQTTClient) IsConnected() bool {
+	return c.client.IsConnected()
+}
+
 // Publish はメッセージをパブリッシュします
-func Publish(client MQTT.Client, topic string, qos byte, retained bool, payload any) error {
-	mutex.Lock()
-	defer mutex.Unlock()
+func (c *PahoMQTTClient) Publish(topic string, qos byte, retained bool, payload interface{}) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
-	if token := client.Publish(topic, qos, retained, payload); token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to publish to topic %s: %v", topic, token.Error())
+	token := c.client.Publish(topic, qos, retained, payload)
+	if token.Wait() && token.Error() != nil {
+		return token.Error()
 	}
+	return nil
+}
 
+// Subscribe はトピックをサブスクライブします
+func (c *PahoMQTTClient) Subscribe(topic string, qos byte, callback MQTT.MessageHandler) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	token := c.client.Subscribe(topic, qos, callback)
+	if token.Wait() && token.Error() != nil {
+		return token.Error()
+	}
 	return nil
 }
