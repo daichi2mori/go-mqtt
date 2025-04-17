@@ -1,0 +1,25 @@
+mqtt:
+  broker_url: "tcp://localhost:1883"
+  client_id: "mqtt-client" # 空の場合はランダム生成
+  username: "user" # 必要に応じて
+  password: "pass" # 必要に応じて
+  use_ssl: false
+  ca_cert_path: "" # SSL使用時に指定
+  qos: 1 # デフォルトQoS (0, 1, 2)
+  retained: false # 保持メッセージに設定するか
+
+topics:
+  sensors:
+    name: "sensors/data"
+    description: "センサーデータ用トピック"
+    qos: 1 # オプション：トピック固有QoS
+
+  control:
+    name: "devices/control"
+    description: "デバイス制御用トピック"
+    # QoSを省略するとグローバル設定が使用される
+
+  logs:
+    name: "system/logs"
+    description: "システムログトピック"
+    qos: 0 # 低優先度のログにはQoS 0

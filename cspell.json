@@ -2,6 +2,8 @@
 	"userWords": [
 		"MQTT",
 		"mqttutil",
-		"paho"
+		"paho",
+		"mapstructure",
+		"testuser"
 	]
 }
